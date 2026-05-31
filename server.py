@@ -1,4 +1,4 @@
-import socketserver
+import socket
 import threading
 from converters import CONVERTERS
 
@@ -7,37 +7,61 @@ PORT = 9000
 MAX_PARALLEL = 4
 
 semaphore = threading.Semaphore(MAX_PARALLEL)
+sessions = {}
+sessions_lock = threading.Lock()
 
-class Handler(socketserver.BaseRequestHandler):
-    def handle(self):
-        conn = self.request
-        header = b""
-        while not header.endswith(b"\n"):
-            header += conn.recv(1)
-        format_in, format_out, size = header.decode().strip().split(":")
-        size = int(size)
-        data = b""
-        while len(data) < size:
-            chunk = conn.recv(min(4096, size - len(data)))
-            if not chunk:
-                break
-            data += chunk
 
-        key = f"{format_in}:{format_out}"
-        if key not in CONVERTERS:
-            conn.sendall(f"ERR:formato '{key}' nao suportado\n".encode())
-            return
-        with semaphore:
-            result = CONVERTERS[key](data.decode("utf-8"))
+def handle_conversion(addr, session, sock):
+    key = f"{session['fin']}:{session['fout']}"
+    if key not in CONVERTERS:
+        sock.sendto(f"ERR:formato '{key}' nao suportado\n".encode(), addr)
+        return
+
+    with semaphore:
+        chunks = [session['chunks'][i] for i in sorted(session['chunks'])]
+        data = b"".join(chunks)
+        result = CONVERTERS[key](data.decode("utf-8"))
         result_bytes = result.encode("utf-8")
-        conn.sendall(f"OK:{len(result_bytes)}\n".encode())
-        conn.sendall(result_bytes)
+        sock.sendto(f"OK:{len(result_bytes)}\n".encode(), addr)
+        sock.sendto(result_bytes, addr)
 
-class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    allow_reuse_address = True
-    daemon_threads = True
 
-if __name__ == "__main__":
-    with Server((HOST, PORT), Handler) as server:
-        print(f"Servidor rodando em {HOST}:{PORT}")
-        server.serve_forever()
+HOST_PORT = (HOST, PORT)
+
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server_sock:
+    server_sock.bind(HOST_PORT)
+    while True:
+        packet, addr = server_sock.recvfrom(65535)
+        if packet.startswith(b"HDR:"):
+            parts = packet.decode().strip().split(":")
+            if len(parts) != 4:
+                continue
+            _, fin, fout, size = parts
+            session = {
+                "fin": fin,
+                "fout": fout,
+                "size": int(size),
+                "received": 0,
+                "chunks": {},
+            }
+            with sessions_lock:
+                sessions[addr] = session
+            server_sock.sendto(b"ACK:HDR\n", addr)
+
+        elif packet.startswith(b"DAT:"):
+            header, payload = packet.split(b":", 3)[1:4], packet.split(b":", 3)[3]
+            seq = int(header[0])
+            length = int(header[1])
+            with sessions_lock:
+                session = sessions.get(addr)
+            if not session:
+                continue
+            if seq not in session["chunks"]:
+                session["chunks"][seq] = payload
+                session["received"] += len(payload)
+            if session["received"] >= session["size"]:
+                with sessions_lock:
+                    sessions.pop(addr, None)
+                thread = threading.Thread(target=handle_conversion, args=(addr, session, server_sock))
+                thread.daemon = True
+                thread.start()

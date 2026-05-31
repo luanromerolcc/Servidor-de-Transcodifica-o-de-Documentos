@@ -26,6 +26,6 @@ def txt_to_upper(text):
 
 CONVERTERS = {
     "md:html":   md_to_html,
-    "html:text": html_to_text,
+    "html:text": html_to_txt,
     "txt:upper": txt_to_upper,
 }
